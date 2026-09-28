@@ -10,7 +10,7 @@ It runs as a background loop inside the same Node.js process as the API server
 | Env var | Purpose |
 |---|---|
 | `NGO_REGISTRY_CONTRACT_ID` | Tracks NGO registrations and admin approvals |
-| `DONATION_VAULT_CONTRACT_ID` | Tracks streaming donation lifecycle (create / withdraw / cancel) |
+| `DONATION_VAULT_CONTRACT_ID` | Tracks streaming donation lifecycle (create / withdraw / cancel / top up / rate change) |
 
 Both ids are optional. The indexer no-ops until at least one is set.
 
@@ -35,8 +35,25 @@ Handler: [`src/indexer/handlers/ngoRegistry.ts`](../src/indexer/handlers/ngoRegi
 | `created` | Yes | Upserts `donors` and `ngos` rows for the involved addresses (creating placeholders if unseen), then upserts a `streams` row with `status = ACTIVE`, initial `balance`, and `withdrawn = 0`. Emits a `stream_created` webhook notification. |
 | `withdraw` | Yes | Subtracts the accrued amount from `streams.balance` and adds it to `streams.withdrawn`. No-ops if the stream row does not exist. Emits a `stream_withdrawn` notification. |
 | `cancel` | Yes | Adds the settled amount to `streams.withdrawn`, zeroes `balance` and `rate`, sets `status = CANCELLED`. No-ops if the stream row does not exist. Emits a `stream_cancelled` notification. |
-| `topup` | No | The event only publishes the new deposit amount, not how much accrued and settled to the NGO during the same call, so the post-topup balance cannot be reconstructed from the payload alone without either a contract read or duplicating the accrual math. Tracked as a follow-up. |
-| `ratemod` | No | Same reason as `topup` — the new rate is known but the accrual that settled at the moment of the rate change is not. Tracked as a follow-up. |
+| `topup` | Yes | Reads the stream back from the contract with a simulated, read-only `get_stream` call and overwrites `streams.rate`, `balance` and `withdrawn` with the returned values. No-ops if the stream row does not exist. No notification. |
+| `ratemod` | Yes | Same as `topup`. |
+
+Both events settle whatever accrued at the old rate to the NGO before applying
+the change, but their payloads only carry the new amount or rate, so the
+resulting balance and withdrawn total can't be derived from the event. Instead
+the handler asks the contract (see
+[`src/stellar/vault.ts`](../src/stellar/vault.ts)). The values it writes are
+absolute, not deltas.
+
+- **Failed reads are retried.** If the RPC call fails, the handler throws, the
+  event is not checkpointed, and it is processed again on the next poll. A read
+  that keeps failing (for example the stream no longer exists on-chain) holds
+  the indexer at that event until it succeeds.
+- **The read is of the latest ledger, not the event's ledger.** If a `withdraw`
+  or `cancel` for the same stream was emitted after the `topup` / `ratemod`
+  and both are in the same batch, the read already includes it, and the
+  delta-based `withdraw` handler then applies it a second time. Simulation
+  can't be pinned to an older ledger, so this is a known limitation.
 
 Handler: [`src/indexer/handlers/donationVault.ts`](../src/indexer/handlers/donationVault.ts)
 

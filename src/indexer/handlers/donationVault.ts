@@ -2,6 +2,7 @@ import { scValToNative } from '@stellar/stellar-sdk';
 
 import { prisma } from '../../db.js';
 import { notify } from '../../notifications/service.js';
+import { readStream } from '../../stellar/vault.js';
 import type { ContractEvent } from '../worker.js';
 
 async function ensureDonor(address: string) {
@@ -148,11 +149,50 @@ async function handleCancel(event: ContractEvent): Promise<void> {
 }
 
 /**
+ * Handles the donation-vault contract's `topup` and `ratemod` events,
+ * emitted when a donor adds funds to a stream or changes its rate.
+ *
+ * Writes: reads the stream back from the contract (`get_stream`, simulated
+ * through the RPC) and overwrites the matching `stream` row's `rate`,
+ * `balance` and `withdrawn` with what it returns. No-ops if the stream isn't
+ * known yet. No notification is emitted.
+ *
+ * Both events settle whatever accrued at the old rate to the NGO before
+ * applying the change, but their payloads only carry the new amount / rate,
+ * so the resulting balance and withdrawn total can't be derived from the
+ * event. Reading the contract state is the source of truth. The values
+ * written are absolute, so retrying after a failed read is safe: if the
+ * read throws, the event isn't checkpointed and is picked up again on the
+ * next poll.
+ */
+async function handleStreamModified(event: ContractEvent): Promise<void> {
+  const [, streamIdVal] = event.topic;
+  const onChainId = scValToNative(streamIdVal) as bigint;
+
+  const stream = await prisma.stream.findUnique({ where: { onChainId } });
+  if (!stream) return;
+
+  const contractId = event.contractId?.toString();
+  if (!contractId) return;
+
+  const onChain = await readStream(contractId, onChainId);
+
+  await prisma.stream.update({
+    where: { onChainId },
+    data: {
+      rate: onChain.rate.toString(),
+      balance: onChain.balance.toString(),
+      withdrawn: onChain.withdrawn.toString(),
+    },
+  });
+}
+
+/**
  * Entry point for all donation-vault contract events. Dispatches on the
  * event's topic to the handler for that on-chain event:
  * `created` → {@link handleStreamCreated}, `withdraw` → {@link handleWithdraw},
- * `cancel` → {@link handleCancel}. `topup` and `ratemod` are deliberately
- * unhandled for now (see comment below); any other topic is ignored.
+ * `cancel` → {@link handleCancel}, `topup` / `ratemod` →
+ * {@link handleStreamModified}; any other topic is ignored.
  */
 export async function handleDonationVaultEvent(event: ContractEvent): Promise<void> {
   const [topicSymbol] = event.topic;
@@ -170,12 +210,7 @@ export async function handleDonationVaultEvent(event: ContractEvent): Promise<vo
       break;
     case 'topup':
     case 'ratemod':
-      // Deliberately unhandled for now: both events only publish the new
-      // amount/rate, not how much accrued and settled to the NGO during
-      // the same call, so the new balance can't be reconstructed from the
-      // event payload alone without either a verified read-only contract
-      // call (get_stream) or duplicating the contract's accrual math here
-      // — both real work, tracked as follow-up rather than guessed at.
+      await handleStreamModified(event);
       break;
     default:
       break;
