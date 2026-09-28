@@ -66,6 +66,130 @@ See [docs/INDEXER.md](./docs/INDEXER.md) for a full table of which on-chain
 events the indexer handles, which tables each one writes, and how the
 checkpoint and out-of-window recovery work.
 
+## Admin authentication
+
+The admin routes (`GET /ngo-applications`, `GET /ngo-applications/:id`,
+`POST /ngo-applications/:id/approve` and `POST /ngo-applications/:id/reject`)
+don't use passwords or API keys. Each request is signed with the Stellar
+keypair whose public key is configured as `ADMIN_ADDRESS`, so no secret ever
+crosses the wire. The check lives in
+[`src/middleware/adminAuth.ts`](./src/middleware/adminAuth.ts).
+
+### Headers
+
+Send all three headers on every admin request:
+
+| Header | Value |
+|---|---|
+| `x-admin-address` | The admin's Stellar public key (`G...`). Must equal `ADMIN_ADDRESS` exactly. |
+| `x-admin-timestamp` | The time of signing, as Unix time in **milliseconds** (e.g. `Date.now().toString()`). |
+| `x-admin-signature` | The signature over the payload below, encoded as base64 or hex. |
+
+### Signed payload
+
+The signed message is the request method, the request URL and the timestamp
+header, joined with colons:
+
+```
+METHOD:URL:TIMESTAMP
+```
+
+- `METHOD` is the upper-case HTTP method, e.g. `POST`.
+- `URL` is the request target exactly as sent: the path **plus the query
+  string**, with no scheme or host. `/ngo-applications?status=PENDING&limit=10`
+  and `/ngo-applications` are different payloads, so sign the same string you
+  request. Query parameters are not reordered or normalised.
+- `TIMESTAMP` is the exact string sent in `x-admin-timestamp`.
+
+For example: `POST:/ngo-applications/8a1c.../approve:1767225600000`
+
+The signature only covers the method, URL and timestamp, not the request body.
+
+### SEP-53 hashing
+
+The payload is signed as a Stellar message per
+[SEP-53](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0053.md),
+not as raw bytes. The signature is an ed25519 signature over
+
+```
+SHA-256("Stellar Signed Message:\n" + payload)
+```
+
+where `"Stellar Signed Message:\n"` is the fixed SEP-53 prefix (including the
+trailing newline) and the payload is UTF-8 encoded. This is what a wallet's
+generic message-signing call does, and what `Keypair.signMessage` in
+`@stellar/stellar-sdk` does. Signing the raw
+payload, or signing it with a wallet's transaction-signing call, will not
+verify.
+
+### Accepted signature encodings
+
+SEP-53 fixes what is signed but not how a wallet returns the signature, so the
+server accepts either:
+
+- **base64** (88 characters for a 64-byte signature), or
+- **hex** (128 characters).
+
+Either way the decoded signature must be exactly 64 bytes, and it still has to
+verify against `ADMIN_ADDRESS`. Anything else is rejected.
+
+### Time window
+
+The timestamp must be within **five minutes** of the server's clock, in either
+direction. A captured set of headers can be replayed for the same method and URL
+within that window, so send requests over HTTPS and keep the client's clock
+roughly in sync (NTP).
+
+### Responses
+
+| Status | Body | Meaning |
+|---|---|---|
+| `503` | `{ "error": "admin_auth_not_configured" }` | `ADMIN_ADDRESS` is not set on the server. |
+| `401` | `{ "error": "unauthorized" }` | A header is missing, the address isn't the admin, or the signature didn't verify. |
+| `401` | `{ "error": "stale_signature" }` | The timestamp is not a number or is outside the five-minute window. |
+
+The server can't tell a bad signature from a wrong payload, so a `401
+unauthorized` from an otherwise well-formed request usually means the signed
+`URL` (query string included) or the SEP-53 hashing didn't match. The server logs
+the payload it expected.
+
+### Example
+
+Producing the headers with `@stellar/stellar-sdk` (`Keypair.signMessage` applies
+the SEP-53 prefix and hash for you):
+
+```ts
+import { Keypair } from '@stellar/stellar-sdk';
+
+const adminKeypair = Keypair.fromSecret(process.env.ADMIN_SECRET!); // the ADMIN_ADDRESS keypair
+
+function adminHeaders(method: string, url: string): Record<string, string> {
+  const timestamp = Date.now().toString();
+  const payload = `${method}:${url}:${timestamp}`;
+  const signature = Buffer.from(adminKeypair.signMessage(payload)).toString('base64');
+
+  return {
+    'x-admin-address': adminKeypair.publicKey(),
+    'x-admin-signature': signature,
+    'x-admin-timestamp': timestamp,
+  };
+}
+
+// The URL you sign must be the URL you request, query string included.
+const url = '/ngo-applications?status=PENDING';
+const response = await fetch(`https://api.example.com${url}`, {
+  headers: adminHeaders('GET', url),
+});
+```
+
+`signMessage` returns a `Uint8Array`, so wrap it in `Buffer.from(...)` before
+calling `.toString('base64')`; calling `toString('base64')` on the array itself
+ignores the encoding and yields a string of decimal bytes.
+
+For a browser client, the API's `CORS_ORIGINS` must include your origin, or the
+browser will block the `x-admin-*` headers on the preflight request. It is a
+comma-separated list of origins and defaults to `http://localhost:3001`.
+
 ## Notification events
 
 When `NOTIFY_WEBHOOK_URL` is set, the indexer POSTs a JSON body to that URL
